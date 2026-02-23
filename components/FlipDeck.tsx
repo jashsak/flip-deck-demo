@@ -1,14 +1,6 @@
 "use client";
 
-import { useState, useRef, useCallback, useMemo } from "react";
-import {
-  motion,
-  useMotionValue,
-  useTransform,
-  animate,
-  useMotionValueEvent,
-  type PanInfo,
-} from "motion/react";
+import { useState, useRef, useCallback, useEffect } from "react";
 import { useDialKit } from "dialkit";
 
 const CARDS = [
@@ -34,256 +26,326 @@ const CARDS = [
   },
 ];
 
-// Card width used for calculating drag-as-fraction
 const CARD_W = 400;
+const CARD_H = 533;
 
+/**
+ * Collins-style flipbook: a hidden horizontal scroll carousel drives
+ * continuous 3D transforms on a stacked set of cards.
+ *
+ * Architecture:
+ * 1. A hidden <div> with overflow-x: auto holds N "slides" (each slide = 1 card width).
+ *    The user drags/scrolls this element (it's invisible but covers the stack).
+ * 2. On each scroll event (via rAF), we compute a fractional "activeIndex" from scrollLeft.
+ * 3. Each card's transform/opacity is derived from its distance to that fractional index.
+ *
+ * Collins reference values (from source inspection):
+ * - Center card: transform: none, opacity: 1
+ * - ±1 neighbor: translateX(±25%) translateZ(-200px) rotateY(∓25deg), opacity: 0
+ * - ±2: translateZ(-400px), opacity: 0, visibility: hidden
+ * - Halfway between cards: both at ±48% translateX, -100px Z, ±20deg rotateY
+ * - Perspective: 800px on the stack container
+ * - Cards stack via grid-area: 1/1 (all overlap)
+ */
 export default function FlipDeck() {
-  const [activeIndex, setActiveIndex] = useState(0);
-
   const values = useDialKit("Flip Deck", {
-    spring: { type: "spring" as const, visualDuration: 0.5, bounce: 0.15 },
-
+    // 3D positioning
     rotateY: [25, 0, 45],
     translateZ: [200, 50, 600],
     translateX: [25, 0, 50],
-    perspective: [1500, 500, 3000],
+    perspective: [800, 300, 2000],
 
+    // Card appearance
     borderRadius: [16, 0, 48],
     shadowOpacity: [0.6, 0, 1],
 
-    dragThreshold: [100, 30, 300],
-
-    tiltOnDrag: true,
-    tiltAngle: [10, 0, 30],
-
-    // @ts-expect-error DialKit action type
-    reset: () => {
-      setActiveIndex(0);
-      animate(dragX, 0, { type: "spring", visualDuration: 0.2, bounce: 0 });
-    },
+    // Halfway spread — how far cards fan out at the midpoint
+    midSpreadX: [48, 20, 70],
+    midSpreadZ: [100, 20, 300],
+    midRotateY: [20, 0, 40],
   }) as any as {
-    spring: { type: "spring"; visualDuration: number; bounce: number };
     rotateY: number;
     translateZ: number;
     translateX: number;
     perspective: number;
     borderRadius: number;
     shadowOpacity: number;
-    dragThreshold: number;
-    tiltOnDrag: boolean;
-    tiltAngle: number;
+    midSpreadX: number;
+    midSpreadZ: number;
+    midRotateY: number;
   };
 
-  // dragX represents the raw pixel drag of the active card.
-  // We convert it to a fractional "progress" value where
-  // -1 = fully swiped left (next card), +1 = fully swiped right (prev card).
-  const dragX = useMotionValue(0);
-  const progress = useTransform(dragX, [-CARD_W, 0, CARD_W], [-1, 0, 1]);
-
-  const handleDragEnd = useCallback(
-    (_: MouseEvent | TouchEvent | PointerEvent, info: PanInfo) => {
-      const threshold = values.dragThreshold;
-      const velocity = info.velocity.x;
-      const offset = info.offset.x;
-
-      let newIndex = activeIndex;
-
-      if (offset < -threshold || velocity < -500) {
-        newIndex = Math.min(activeIndex + 1, CARDS.length - 1);
-      } else if (offset > threshold || velocity > 500) {
-        newIndex = Math.max(activeIndex - 1, 0);
-      }
-
-      setActiveIndex(newIndex);
-      animate(dragX, 0, {
-        type: "spring",
-        visualDuration: values.spring.visualDuration,
-        bounce: values.spring.bounce,
-      });
-    },
-    [activeIndex, values.dragThreshold, values.spring, dragX]
+  const scrollerRef = useRef<HTMLDivElement>(null);
+  const [cardStyles, setCardStyles] = useState<CardStyle[]>(() =>
+    CARDS.map((_, i) => computeCardStyle(i, 0, values))
   );
+  const [activeLabel, setActiveLabel] = useState(CARDS[0].label);
+  const rafRef = useRef<number>(0);
+
+  // Scroll handler — runs on every scroll event via rAF
+  const handleScroll = useCallback(() => {
+    cancelAnimationFrame(rafRef.current);
+    rafRef.current = requestAnimationFrame(() => {
+      const scroller = scrollerRef.current;
+      if (!scroller) return;
+
+      const slideWidth = scroller.scrollWidth / CARDS.length;
+      const fractionalIndex = scroller.scrollLeft / slideWidth;
+
+      const styles = CARDS.map((_, i) =>
+        computeCardStyle(i, fractionalIndex, values)
+      );
+      setCardStyles(styles);
+
+      // Update label based on nearest card
+      const nearest = Math.round(fractionalIndex);
+      setActiveLabel(CARDS[Math.min(nearest, CARDS.length - 1)].label);
+    });
+  }, [values]);
+
+  // Recompute on values change
+  useEffect(() => {
+    handleScroll();
+  }, [handleScroll]);
 
   return (
-    <div className="relative select-none">
+    <div className="relative select-none" style={{ width: CARD_W }}>
+      {/* The visual 3D stack */}
       <div
-        className="relative"
+        className="grid"
         style={{
           perspective: `${values.perspective}px`,
+          transformStyle: "preserve-3d",
           width: CARD_W,
-          height: 533,
+          height: CARD_H + 53, // card + label space
         }}
       >
-        {CARDS.map((card, i) => (
-          <CardItem
-            key={i}
-            card={card}
-            index={i}
-            activeIndex={activeIndex}
-            dragX={dragX}
-            progress={progress}
-            values={values}
-            isActive={i === activeIndex}
-            onDragEnd={handleDragEnd}
-          />
-        ))}
+        {CARDS.map((card, i) => {
+          const s = cardStyles[i];
+          return (
+            <div
+              key={i}
+              className="col-start-1 row-start-1 relative"
+              style={{
+                width: CARD_W,
+                height: CARD_H,
+                gridArea: "1 / 1",
+                transform: s.transform,
+                opacity: s.opacity,
+                visibility: s.visibility,
+                transition: "none", // scroll-driven, no CSS transitions
+                zIndex: s.zIndex,
+              }}
+            >
+              {/* Shadow layer */}
+              <div
+                className="absolute inset-0 pointer-events-none"
+                style={{
+                  borderRadius: values.borderRadius,
+                  boxShadow: `
+                    0px 21px 13px 0px rgba(0,0,0,0.06),
+                    0px 9px 9px 0px rgba(0,0,0,0.1),
+                    0px 2px 5px 0px rgba(0,0,0,0.11)
+                  `,
+                  opacity: s.shadowOpacity,
+                }}
+              />
+              {/* Card cover */}
+              <div
+                className="w-full overflow-hidden"
+                style={{
+                  borderRadius: values.borderRadius,
+                  height: CARD_H,
+                }}
+              >
+                <img
+                  src={card.src}
+                  alt={card.label}
+                  className="w-full h-full object-cover pointer-events-none"
+                  draggable={false}
+                />
+              </div>
+              {/* Card label */}
+              <p
+                className="text-center mt-3 text-base tracking-wide"
+                style={{
+                  fontFamily: "var(--font-playfair), serif",
+                  color: "var(--foreground)",
+                  opacity: s.labelOpacity,
+                }}
+              >
+                {card.label}
+              </p>
+            </div>
+          );
+        })}
       </div>
 
-      {/* Label */}
-      <p
-        className="text-center mt-6 text-lg tracking-wide"
+      {/* Hidden scroll driver — overlays the stack, captures drag/scroll */}
+      <div
+        ref={scrollerRef}
+        onScroll={handleScroll}
+        className="absolute inset-0"
         style={{
-          fontFamily: "var(--font-playfair), serif",
-          color: "var(--foreground)",
-          opacity: 0.8,
+          overflowX: "auto",
+          overflowY: "hidden",
+          scrollSnapType: "x mandatory",
+          // Make scrollbar invisible
+          scrollbarWidth: "none",
+          msOverflowStyle: "none",
+          WebkitOverflowScrolling: "touch",
+          cursor: "grab",
+          zIndex: 20,
         }}
       >
-        {CARDS[activeIndex].label}
-      </p>
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: `repeat(${CARDS.length}, ${CARD_W}px)`,
+            height: "100%",
+          }}
+        >
+          {CARDS.map((_, i) => (
+            <div
+              key={i}
+              style={{
+                width: CARD_W,
+                scrollSnapAlign: "center",
+              }}
+            />
+          ))}
+        </div>
+      </div>
 
       {/* Dots */}
-      <div className="flex justify-center gap-2 mt-4">
-        {CARDS.map((_, i) => (
-          <button
-            key={i}
-            onClick={() => {
-              setActiveIndex(i);
-              animate(dragX, 0, { type: "spring", visualDuration: 0.2, bounce: 0 });
-            }}
-            className="w-2 h-2 rounded-full transition-all duration-300"
-            style={{
-              background: i === activeIndex ? "var(--foreground)" : "var(--muted)",
-              opacity: i === activeIndex ? 1 : 0.4,
-            }}
-          />
-        ))}
+      <div className="flex justify-center gap-2 mt-2">
+        {CARDS.map((_, i) => {
+          const s = cardStyles[i];
+          return (
+            <button
+              key={i}
+              onClick={() => {
+                const scroller = scrollerRef.current;
+                if (!scroller) return;
+                const slideWidth = scroller.scrollWidth / CARDS.length;
+                scroller.scrollTo({
+                  left: i * slideWidth,
+                  behavior: "smooth",
+                });
+              }}
+              className="w-2 h-2 rounded-full transition-colors duration-300"
+              style={{
+                background:
+                  s.opacity > 0.5 ? "var(--foreground)" : "var(--muted)",
+                opacity: s.opacity > 0.5 ? 1 : 0.4,
+              }}
+            />
+          );
+        })}
       </div>
+
+      {/* Hide scrollbar */}
+      <style>{`
+        div::-webkit-scrollbar { display: none; }
+      `}</style>
     </div>
   );
 }
 
+interface CardStyle {
+  transform: string;
+  opacity: number;
+  visibility: "visible" | "hidden";
+  zIndex: number;
+  shadowOpacity: number;
+  labelOpacity: number;
+}
+
 /**
- * Each card computes its own transforms from the shared `progress` motion value.
- * This means ALL cards update continuously as the user drags — not just on release.
+ * Compute a card's 3D style based on its distance from the fractional active index.
+ *
+ * Collins interpolation (observed from scroll positions 0, 316, 632):
+ * - At offset 0 (center): transform: none, opacity: 1
+ * - At offset 0.5 (halfway): translateX(±48%), translateZ(-100px), rotateY(±20deg), opacity: 0
+ * - At offset 1.0 (neighbor): translateX(±25%), translateZ(-200px), rotateY(±25deg), opacity: 0
+ * - At offset 2.0+: translateZ(-400px+), visibility: hidden
+ *
+ * The halfway state is interesting: cards spread WIDER (48%) but are CLOSER in Z (-100px)
+ * and have LESS rotation (20deg) than the resting neighbor state (25%, -200px, 25deg).
+ * This creates the "fanning out" feel during the swipe.
  */
-function CardItem({
-  card,
-  index,
-  activeIndex,
-  dragX,
-  progress,
-  values,
-  isActive,
-  onDragEnd,
-}: {
-  card: (typeof CARDS)[number];
-  index: number;
-  activeIndex: number;
-  dragX: any;
-  progress: any;
-  values: any;
-  isActive: boolean;
-  onDragEnd: (e: any, info: PanInfo) => void;
-}) {
-  // The "slot" this card occupies relative to center.
-  // When progress = 0, slot = index - activeIndex.
-  // When progress = -1 (swiped left), effectively slot shifts by +1.
-  // When progress = +1 (swiped right), slot shifts by -1.
-  const baseOffset = index - activeIndex;
+function computeCardStyle(
+  cardIndex: number,
+  fractionalIndex: number,
+  v: any
+): CardStyle {
+  const offset = cardIndex - fractionalIndex; // negative = card is to the left
+  const absOffset = Math.abs(offset);
+  const sign = offset >= 0 ? 1 : -1;
 
-  // Continuous slot position: how far this card is from center, accounting for drag.
-  // slot = baseOffset + progress (because dragging left = progress goes negative = cards shift right)
-  const slot = useTransform(progress, (p: number) => baseOffset + p);
+  // Cards beyond 2 positions away are hidden
+  if (absOffset > 2.5) {
+    return {
+      transform: `translateX(${sign * v.translateX}%) translateZ(${-v.translateZ * 2.5}px) rotateY(${-sign * v.rotateY}deg)`,
+      opacity: 0,
+      visibility: "hidden",
+      zIndex: 0,
+      shadowOpacity: 0,
+      labelOpacity: 0,
+    };
+  }
 
-  // Now derive all transforms from `slot`
-  const x = useTransform(slot, (s: number) => {
-    if (Math.abs(s) < 0.01) return 0;
-    const sign = s > 0 ? 1 : -1;
-    const magnitude = Math.min(Math.abs(s), 2);
-    return sign * magnitude * values.translateX * (CARD_W / 100);
-  });
+  // Center card (offset ~0)
+  if (absOffset < 0.01) {
+    return {
+      transform: "none",
+      opacity: 1,
+      visibility: "visible",
+      zIndex: 10,
+      shadowOpacity: v.shadowOpacity,
+      labelOpacity: 1,
+    };
+  }
 
-  const z = useTransform(slot, (s: number) => {
-    const magnitude = Math.min(Math.abs(s), 2);
-    return -magnitude * values.translateZ;
-  });
+  // Interpolation:
+  // Collins uses a non-linear path:
+  // offset 0→0.5: card fans OUT (wider X, shallow Z, moderate rotation)
+  // offset 0.5→1: card tucks IN (narrower X, deeper Z, full rotation)
 
-  const rotateY = useTransform(slot, (s: number) => {
-    if (Math.abs(s) < 0.01) return 0;
-    const sign = s > 0 ? 1 : -1;
-    const magnitude = Math.min(Math.abs(s), 2);
-    // Note: sign is OPPOSITE — left cards rotate positively (face right)
-    return -sign * magnitude * values.rotateY;
-  });
+  let tx: number, tz: number, ry: number, opacity: number;
 
-  const opacity = useTransform(slot, (s: number) => {
-    const abs = Math.abs(s);
-    if (abs > 2) return 0;
-    if (abs > 1) return Math.max(0, 1 - (abs - 1)) * 0.7;
-    if (abs < 0.01) return 1;
-    // Interpolate between 1 (center) and 0.7 (one step away)
-    return 1 - abs * 0.3;
-  });
+  if (absOffset <= 0.5) {
+    // Phase 1: fanning out. Lerp from center to mid-spread.
+    const t = absOffset / 0.5; // 0→1 over this phase
+    tx = sign * lerp(0, v.midSpreadX, t);
+    tz = -lerp(0, v.midSpreadZ, t);
+    ry = -sign * lerp(0, v.midRotateY, t);
+    opacity = lerp(1, 0, t);
+  } else if (absOffset <= 1) {
+    // Phase 2: tucking in. Lerp from mid-spread to neighbor rest.
+    const t = (absOffset - 0.5) / 0.5; // 0→1 over this phase
+    tx = sign * lerp(v.midSpreadX, v.translateX, t);
+    tz = -lerp(v.midSpreadZ, v.translateZ, t);
+    ry = -sign * lerp(v.midRotateY, v.rotateY, t);
+    opacity = 0;
+  } else {
+    // Beyond 1: deeper in stack
+    tx = sign * v.translateX;
+    tz = -(v.translateZ * absOffset);
+    ry = -sign * v.rotateY;
+    opacity = 0;
+  }
 
-  const zIndex = useTransform(slot, (s: number) => {
-    return Math.round(10 - Math.abs(s) * 2);
-  });
+  return {
+    transform: `translateX(${tx}%) translateZ(${tz}px) rotateY(${ry}deg)`,
+    opacity,
+    visibility: absOffset <= 2 ? "visible" : "hidden",
+    zIndex: Math.round(10 - absOffset * 2),
+    shadowOpacity: absOffset <= 1 ? v.shadowOpacity * (1 - absOffset) : 0,
+    labelOpacity: absOffset < 0.3 ? 1 - absOffset / 0.3 : 0,
+  };
+}
 
-  const visibility = useTransform(slot, (s: number) =>
-    Math.abs(s) > 2.5 ? "hidden" : "visible"
-  );
-
-  // Tilt only the active card during drag
-  const rotateX = useTransform(dragX, [-300, 0, 300], [
-    values.tiltOnDrag ? values.tiltAngle : 0,
-    0,
-    values.tiltOnDrag ? -values.tiltAngle : 0,
-  ]);
-
-  return (
-    <motion.div
-      className="absolute inset-0"
-      drag={isActive ? "x" : false}
-      dragConstraints={isActive ? { left: 0, right: 0 } : undefined}
-      dragElastic={isActive ? 0.7 : undefined}
-      onDragEnd={isActive ? onDragEnd : undefined}
-      style={{
-        x: isActive ? dragX : x,
-        z,
-        rotateY,
-        opacity,
-        zIndex,
-        visibility,
-        transformStyle: "preserve-3d",
-        ...(isActive ? { rotateX } : {}),
-      }}
-    >
-      {/* Shadow layer — pre-rendered, opacity only */}
-      <div
-        className="absolute inset-0 pointer-events-none"
-        style={{
-          borderRadius: values.borderRadius,
-          boxShadow: `
-            0px 21px 13px 0px rgba(0,0,0,0.06),
-            0px 9px 9px 0px rgba(0,0,0,0.1),
-            0px 2px 5px 0px rgba(0,0,0,0.11)
-          `,
-          opacity: isActive ? values.shadowOpacity : values.shadowOpacity * 0.5,
-          transition: "opacity 0.8s cubic-bezier(0.19, 1, 0.22, 1)",
-        }}
-      />
-      {/* Card content */}
-      <div
-        className="w-full h-full overflow-hidden"
-        style={{ borderRadius: values.borderRadius }}
-      >
-        <img
-          src={card.src}
-          alt={card.label}
-          className="w-full h-full object-cover pointer-events-none"
-          draggable={false}
-        />
-      </div>
-    </motion.div>
-  );
+function lerp(a: number, b: number, t: number): number {
+  return a + (b - a) * t;
 }
