@@ -21,3 +21,9 @@ body {
   overflow: hidden;
   -webkit-font-smoothing: antialiased;
 }
+
+/* Constrain DialKit panel so Export Code + credit fit below */
+.dialkit-panel {
+  max-height: 80vh !important;
+  overflow-y: auto !important;
+}
